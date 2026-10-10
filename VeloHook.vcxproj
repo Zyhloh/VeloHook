@@ -36,7 +36,6 @@
     <ConfigurationType>StaticLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
     <PlatformToolset>v145</PlatformToolset>
-    <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
@@ -49,7 +48,6 @@
     <ConfigurationType>StaticLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
     <PlatformToolset>v145</PlatformToolset>
-    <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
@@ -143,6 +141,7 @@
     <ClInclude Include="pch.h" />
     <ClInclude Include="include\VeloHook.h" />
     <ClInclude Include="src\internal.h" />
+    <ClInclude Include="third_party\minhook\include\MinHook.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="pch.cpp">
@@ -151,10 +150,38 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>
     </ClCompile>
-    <ClCompile Include="VeloHook.cpp" />
     <ClCompile Include="src\api.cpp" />
+    <ClCompile Include="src\frame.cpp" />
+    <ClCompile Include="src\frame_dxgi.cpp" />
+    <ClCompile Include="src\frame_opengl.cpp" />
+    <ClCompile Include="src\frame_vulkan.cpp" />
     <ClCompile Include="src\graphics.cpp" />
+    <ClCompile Include="src\inline.cpp" />
+    <ClCompile Include="src\input.cpp" />
+    <ClCompile Include="src\lifecycle.cpp" />
+    <ClCompile Include="src\opengl.cpp" />
     <ClCompile Include="src\vtable.cpp" />
+    <ClCompile Include="src\vulkan.cpp" />
+    <ClCompile Include="third_party\minhook\src\buffer.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <WarningLevel>Level1</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="third_party\minhook\src\hook.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <WarningLevel>Level1</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="third_party\minhook\src\trampoline.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <WarningLevel>Level1</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="third_party\minhook\src\hde\hde32.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <WarningLevel>Level1</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="third_party\minhook\src\hde\hde64.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <WarningLevel>Level1</WarningLevel>
+    </ClCompile>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

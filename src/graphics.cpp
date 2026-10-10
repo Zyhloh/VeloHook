@@ -1,11 +1,62 @@
 #include "pch.h"
 #include "internal.h"
 
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+
 namespace VeloHook {
 namespace Internal {
 
-static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    return DefWindowProcW(h, m, w, l);
+static constexpr wchar_t kDummyClass[] = L"VH_Dummy";
+
+using CreateDXGIFactory1_t = HRESULT(WINAPI*)(REFIID, void**);
+
+template <typename T>
+static T LoadExport(const wchar_t* module, const char* name) {
+    HMODULE mod = LoadLibraryW(module);
+    return mod ? reinterpret_cast<T>(GetProcAddress(mod, name)) : nullptr;
+}
+
+struct WndEnum {
+    DWORD pid;
+    HWND hwnd;
+    long long area;
+};
+
+static BOOL CALLBACK EnumProc(HWND h, LPARAM p) {
+    auto* e = reinterpret_cast<WndEnum*>(p);
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid != e->pid) return TRUE;
+    if (!IsWindowVisible(h) || GetWindow(h, GW_OWNER)) return TRUE;
+
+    RECT r;
+    if (!GetClientRect(h, &r)) return TRUE;
+
+    long long w = r.right - r.left;
+    long long ht = r.bottom - r.top;
+    if (w < 100 || ht < 100) return TRUE;
+
+    wchar_t cls[64]{};
+    GetClassNameW(h, cls, static_cast<int>(std::size(cls)));
+    if (wcscmp(cls, L"ConsoleWindowClass") == 0) return TRUE;
+    if (wcscmp(cls, L"MSCTFIME UI") == 0) return TRUE;
+    if (wcscmp(cls, L"IME") == 0) return TRUE;
+    if (wcscmp(cls, kDummyClass) == 0) return TRUE;
+    if (wcsstr(cls, L"Tooltip")) return TRUE;
+
+    if (w * ht > e->area) {
+        e->area = w * ht;
+        e->hwnd = h;
+    }
+
+    return TRUE;
+}
+
+HWND FindMainWindow() {
+    WndEnum e{ GetCurrentProcessId(), nullptr, 0 };
+    EnumWindows(EnumProc, reinterpret_cast<LPARAM>(&e));
+    return e.hwnd;
 }
 
 Graphics& Graphics::Get() {
@@ -13,22 +64,21 @@ Graphics& Graphics::Get() {
     return inst;
 }
 
-Graphics::~Graphics() {
-    Release();
-}
-
 bool Graphics::MakeDummyWindow() {
+    if (m_dummy) return true;
+
+    HINSTANCE inst = reinterpret_cast<HINSTANCE>(&__ImageBase);
+
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
-    wc.style = CS_HREDRAW | CS_VREDRAW;
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = GetModuleHandleW(nullptr);
-    wc.lpszClassName = L"VH_Dummy";
-    
-    RegisterClassExW(&wc);
-    
-    m_dummy = CreateWindowExW(0, L"VH_Dummy", L"", WS_OVERLAPPEDWINDOW,
-                              0, 0, 4, 4, nullptr, nullptr, wc.hInstance, nullptr);
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = inst;
+    wc.lpszClassName = kDummyClass;
+
+    if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
+
+    m_dummy = CreateWindowExW(0, kDummyClass, L"", WS_OVERLAPPEDWINDOW,
+                              0, 0, 8, 8, nullptr, nullptr, inst, nullptr);
     return m_dummy != nullptr;
 }
 
@@ -37,222 +87,165 @@ void Graphics::KillDummyWindow() {
         DestroyWindow(m_dummy);
         m_dummy = nullptr;
     }
+    UnregisterClassW(kDummyClass, reinterpret_cast<HINSTANCE>(&__ImageBase));
 }
 
-bool Graphics::Init() {
-    if (m_ready) return true;
-    if (!MakeDummyWindow()) return false;
-    m_ready = true;
+bool Graphics::Setup(GraphicsAPI api) {
+    if (m_api != GraphicsAPI::None) return true;
+
+    m_hwnd = FindMainWindow();
+
+    if (api == GraphicsAPI::Auto) api = Detect();
+
+    bool ok = false;
+    switch (api) {
+        case GraphicsAPI::DirectX11: ok = SetupDX11(); break;
+        case GraphicsAPI::DirectX12: ok = SetupDX12(); break;
+        case GraphicsAPI::OpenGL: ok = GLBackend::Get().Setup(true); break;
+        case GraphicsAPI::Vulkan: ok = VKBackend::Get().Setup(true); break;
+        default: break;
+    }
+
+    if (!ok) {
+        Release();
+        return false;
+    }
+
+    m_api = api;
     return true;
 }
 
 void Graphics::Release() {
-    if (m_11sc) { m_11sc->Release(); m_11sc = nullptr; }
-    if (m_11ctx) { m_11ctx->Release(); m_11ctx = nullptr; }
-    if (m_11dev) { m_11dev->Release(); m_11dev = nullptr; }
-    
-    if (m_12sc) { m_12sc->Release(); m_12sc = nullptr; }
-    if (m_12cmd) { m_12cmd->Release(); m_12cmd = nullptr; }
-    if (m_12dev) { m_12dev->Release(); m_12dev = nullptr; }
-    
+    m_11sc.Reset();
+    m_11ctx.Reset();
+    m_11dev.Reset();
+
+    m_12sc.Reset();
+    m_12cmd.Reset();
+    m_12dev.Reset();
+
     KillDummyWindow();
-    m_ready = false;
-    m_api = 0;
+    m_hwnd = nullptr;
+    m_api = GraphicsAPI::None;
+}
+
+GraphicsAPI Graphics::Detect() {
+    bool has11 = GetModuleHandleW(L"d3d11.dll") != nullptr;
+    bool has12 = GetModuleHandleW(L"d3d12.dll") != nullptr;
+
+    if (!has11 && !has12) {
+        if (GetModuleHandleW(L"vulkan-1.dll")) return GraphicsAPI::Vulkan;
+        if (GetModuleHandleW(L"opengl32.dll")) return GraphicsAPI::OpenGL;
+        return GraphicsAPI::None;
+    }
+
+    if (has12 && !has11) return GraphicsAPI::DirectX12;
+    if (has11 && !has12) return GraphicsAPI::DirectX11;
+
+    if (SetupDX11()) {
+        SetupDX12();
+        return GraphicsAPI::DirectX11;
+    }
+    return GraphicsAPI::DirectX12;
 }
 
 bool Graphics::SetupDX11() {
     if (m_11sc) return true;
-    if (!m_dummy && !MakeDummyWindow()) return false;
-    
+    if (!MakeDummyWindow()) return false;
+
+    auto create = LoadExport<PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN>(L"d3d11.dll", "D3D11CreateDeviceAndSwapChain");
+    if (!create) return false;
+
     DXGI_SWAP_CHAIN_DESC sd{};
     sd.BufferCount = 1;
-    sd.BufferDesc.Width = 4;
-    sd.BufferDesc.Height = 4;
+    sd.BufferDesc.Width = 8;
+    sd.BufferDesc.Height = 8;
     sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    sd.BufferDesc.RefreshRate.Numerator = 60;
-    sd.BufferDesc.RefreshRate.Denominator = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.OutputWindow = m_dummy;
     sd.SampleDesc.Count = 1;
     sd.Windowed = TRUE;
     sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-    
-    D3D_FEATURE_LEVEL fl;
-    D3D_FEATURE_LEVEL fls[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1 };
-    
-    HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-                                                fls, 2, D3D11_SDK_VERSION, &sd,
-                                                &m_11sc, &m_11dev, &fl, &m_11ctx);
-    if (FAILED(hr)) {
-        hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0,
-                                           fls, 2, D3D11_SDK_VERSION, &sd,
-                                           &m_11sc, &m_11dev, &fl, &m_11ctx);
+
+    const D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1 };
+
+    for (D3D_DRIVER_TYPE driver : { D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP }) {
+        HRESULT hr = create(nullptr, driver, nullptr, 0, levels, static_cast<UINT>(std::size(levels)),
+                            D3D11_SDK_VERSION, &sd, &m_11sc, &m_11dev, nullptr, &m_11ctx);
+        if (SUCCEEDED(hr)) return true;
     }
-    
-    if (FAILED(hr)) return false;
-    
-    m_scVT = *reinterpret_cast<void***>(m_11sc);
-    m_devVT = *reinterpret_cast<void***>(m_11dev);
-    m_ctxVT = *reinterpret_cast<void***>(m_11ctx);
-    m_sc = m_11sc;
-    m_dev = m_11dev;
-    m_ctx = m_11ctx;
-    
-    return true;
+
+    return false;
 }
 
 bool Graphics::SetupDX12() {
     if (m_12sc) return true;
-    if (!m_dummy && !MakeDummyWindow()) return false;
-    
-    if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&m_12dev)))) {
-        return false;
-    }
-    
+    if (!MakeDummyWindow()) return false;
+
+    auto createDevice = LoadExport<PFN_D3D12_CREATE_DEVICE>(L"d3d12.dll", "D3D12CreateDevice");
+    auto createFactory = LoadExport<CreateDXGIFactory1_t>(L"dxgi.dll", "CreateDXGIFactory1");
+    if (!createDevice || !createFactory) return false;
+
+    ComPtr<ID3D12Device> dev;
+    if (FAILED(createDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev)))) return false;
+
     D3D12_COMMAND_QUEUE_DESC qd{};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    
-    if (FAILED(m_12dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&m_12cmd)))) {
-        m_12dev->Release();
-        m_12dev = nullptr;
-        return false;
-    }
-    
-    IDXGIFactory4* factory = nullptr;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
-        m_12cmd->Release(); m_12cmd = nullptr;
-        m_12dev->Release(); m_12dev = nullptr;
-        return false;
-    }
-    
+
+    ComPtr<ID3D12CommandQueue> cmd;
+    if (FAILED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&cmd)))) return false;
+
+    ComPtr<IDXGIFactory4> factory;
+    if (FAILED(createFactory(IID_PPV_ARGS(&factory)))) return false;
+
     DXGI_SWAP_CHAIN_DESC1 sd{};
-    sd.Width = 4;
-    sd.Height = 4;
+    sd.Width = 8;
+    sd.Height = 8;
     sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.SampleDesc.Count = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.BufferCount = 2;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    
-    IDXGISwapChain1* sc1 = nullptr;
-    HRESULT hr = factory->CreateSwapChainForHwnd(m_12cmd, m_dummy, &sd, nullptr, nullptr, &sc1);
-    factory->Release();
-    
-    if (FAILED(hr)) {
-        m_12cmd->Release(); m_12cmd = nullptr;
-        m_12dev->Release(); m_12dev = nullptr;
-        return false;
-    }
-    
-    hr = sc1->QueryInterface(IID_PPV_ARGS(&m_12sc));
-    sc1->Release();
-    
-    if (FAILED(hr)) {
-        m_12cmd->Release(); m_12cmd = nullptr;
-        m_12dev->Release(); m_12dev = nullptr;
-        return false;
-    }
-    
-    m_scVT = *reinterpret_cast<void***>(m_12sc);
-    m_devVT = *reinterpret_cast<void***>(m_12dev);
-    m_cmdVT = *reinterpret_cast<void***>(m_12cmd);
-    m_sc = m_12sc;
-    m_dev = m_12dev;
-    m_cmd = m_12cmd;
-    
+
+    ComPtr<IDXGISwapChain1> sc1;
+    if (FAILED(factory->CreateSwapChainForHwnd(cmd.Get(), m_dummy, &sd, nullptr, nullptr, &sc1))) return false;
+
+    ComPtr<IDXGISwapChain3> sc;
+    if (FAILED(sc1.As(&sc))) return false;
+
+    m_12dev = std::move(dev);
+    m_12cmd = std::move(cmd);
+    m_12sc = std::move(sc);
     return true;
 }
 
-struct WndEnum {
-    DWORD pid;
-    HWND hwnd;
-    int score;
-};
-
-static BOOL CALLBACK EnumProc(HWND h, LPARAM p) {
-    WndEnum* e = reinterpret_cast<WndEnum*>(p);
-    
-    DWORD pid;
-    GetWindowThreadProcessId(h, &pid);
-    if (pid != e->pid) return TRUE;
-    
-    if (!IsWindowVisible(h)) return TRUE;
-    if (GetWindow(h, GW_OWNER)) return TRUE;
-    
-    RECT r;
-    if (!GetClientRect(h, &r)) return TRUE;
-    
-    int w = r.right - r.left;
-    int h2 = r.bottom - r.top;
-    if (w < 200 || h2 < 200) return TRUE;
-    
-    wchar_t cls[64];
-    GetClassNameW(h, cls, 64);
-    if (wcscmp(cls, L"ConsoleWindowClass") == 0) return TRUE;
-    if (wcscmp(cls, L"MSCTFIME UI") == 0) return TRUE;
-    if (wcscmp(cls, L"IME") == 0) return TRUE;
-    if (wcsstr(cls, L"Tooltip") != nullptr) return TRUE;
-    
-    int score = w * h2;
-    if (score > e->score) {
-        e->score = score;
-        e->hwnd = h;
-    }
-    
-    return TRUE;
+HWND Graphics::Window() {
+    if (!m_hwnd || !IsWindow(m_hwnd)) m_hwnd = FindMainWindow();
+    return m_hwnd;
 }
 
-static HWND FindWindow() {
-    WndEnum e{};
-    e.pid = GetCurrentProcessId();
-    EnumWindows(EnumProc, reinterpret_cast<LPARAM>(&e));
-    return e.hwnd;
+void* Graphics::SwapChain() const {
+    switch (m_api) {
+        case GraphicsAPI::DirectX11: return m_11sc.Get();
+        case GraphicsAPI::DirectX12: return m_12sc.Get();
+        default: return nullptr;
+    }
 }
 
-int Graphics::Detect() {
-    if (m_forced) {
-        m_api = m_forced;
-        if (m_forced == 1) SetupDX11();
-        else if (m_forced == 2) SetupDX12();
-        return m_api;
+void* Graphics::Device() const {
+    switch (m_api) {
+        case GraphicsAPI::DirectX11: return m_11dev.Get();
+        case GraphicsAPI::DirectX12: return m_12dev.Get();
+        default: return nullptr;
     }
-    
-    m_hwnd = FindWindow();
-    
-    HMODULE h12 = GetModuleHandleW(L"d3d12.dll");
-    HMODULE h11 = GetModuleHandleW(L"d3d11.dll");
-    
-    if (!h11 && !h12) {
-        return 0;
-    }
-    
-    if (h12 && !h11) {
-        if (SetupDX12()) {
-            m_api = 2;
-            return m_api;
-        }
-        return 0;
-    }
-    
-    if (h11 && !h12) {
-        if (SetupDX11()) {
-            m_api = 1;
-            return m_api;
-        }
-        return 0;
-    }
-    
-    if (SetupDX11()) {
-        m_api = 1;
-        return m_api;
-    }
-    
-    if (SetupDX12()) {
-        m_api = 2;
-        return m_api;
-    }
-    
-    return 0;
+}
+
+void* Graphics::Context() const {
+    return m_api != GraphicsAPI::None ? m_11ctx.Get() : nullptr;
+}
+
+void* Graphics::CommandQueue() const {
+    return m_api != GraphicsAPI::None ? m_12cmd.Get() : nullptr;
 }
 
 }}

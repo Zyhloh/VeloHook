@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
+#include <type_traits>
 #include <Windows.h>
 
 namespace VeloHook {
@@ -16,6 +18,11 @@ enum class Status : int {
     DeviceCreationFailed,
     VTableNotFound,
     WrongProcess,
+    FunctionNotFound,
+    UnsupportedFunction,
+    MemoryAllocationFailed,
+    APIUnavailable,
+    HooksBusy,
     Unknown = -1
 };
 
@@ -23,6 +30,8 @@ enum class GraphicsAPI : int {
     Auto = 0,
     DirectX11,
     DirectX12,
+    OpenGL,
+    Vulkan,
     None
 };
 
@@ -65,12 +74,24 @@ namespace SwapChain1 {
     };
 }
 
+namespace SwapChain2 {
+    enum Index : uint32_t {
+        SetSourceSize = 29,
+        GetSourceSize = 30,
+        SetMaximumFrameLatency = 31,
+        GetMaximumFrameLatency = 32,
+        GetFrameLatencyWaitableObject = 33,
+        SetMatrixTransform = 34,
+        GetMatrixTransform = 35
+    };
+}
+
 namespace SwapChain3 {
     enum Index : uint32_t {
-        GetCurrentBackBufferIndex = 29,
-        CheckColorSpaceSupport = 30,
-        SetColorSpace1 = 31,
-        ResizeBuffers1 = 32
+        GetCurrentBackBufferIndex = 36,
+        CheckColorSpaceSupport = 37,
+        SetColorSpace1 = 38,
+        ResizeBuffers1 = 39
     };
 }
 
@@ -266,6 +287,55 @@ namespace CommandQueue12 {
     };
 }
 
+namespace OpenGL {
+    enum Function : uint32_t {
+        SwapBuffers = 0,
+        SwapLayerBuffers,
+        MakeCurrent,
+        CreateContext,
+        DeleteContext,
+        Count
+    };
+}
+
+namespace Vulkan {
+    enum Function : uint32_t {
+        QueuePresentKHR = 0,
+        AcquireNextImageKHR,
+        CreateSwapchainKHR,
+        DestroySwapchainKHR,
+        QueueSubmit,
+        GetDeviceQueue,
+        Count
+    };
+}
+
+enum class ResizeStage : int {
+    Before = 0,
+    After
+};
+
+struct FrameContext {
+    GraphicsAPI api;
+    HWND window;
+    uint32_t width;
+    uint32_t height;
+    uint32_t bufferIndex;
+    uint32_t bufferCount;
+    void* swapChain;
+    void* device;
+    void* context;
+    void* commandQueue;
+    HDC hdc;
+    uint64_t vkSwapchain;
+    int32_t vkFormat;
+    void* vkPresentInfo;
+};
+
+using PresentCallback = std::function<void(FrameContext&)>;
+using ResizeCallback = std::function<void(ResizeStage, const FrameContext&)>;
+using WndProcCallback = std::function<bool(HWND, UINT, WPARAM, LPARAM)>;
+
 void SetTargetProcess(const char* processName);
 void SetTargetProcessW(const wchar_t* processName);
 bool IsTargetProcess();
@@ -277,7 +347,29 @@ bool OpenConsole();
 void CloseConsole();
 void ConsolePrint(const char* fmt, ...);
 
-Status Initialize();
+Status Initialize(GraphicsAPI api = GraphicsAPI::Auto);
+Status Shutdown(uint32_t timeoutMs = 3000);
+void Unload(HMODULE module = nullptr);
+GraphicsAPI GetActiveAPI();
+
+void EnterHook();
+void LeaveHook();
+
+class HookScope {
+public:
+    HookScope() { EnterHook(); }
+    ~HookScope() { LeaveHook(); }
+    HookScope(const HookScope&) = delete;
+    HookScope& operator=(const HookScope&) = delete;
+};
+
+Status OnPresent(PresentCallback callback);
+Status OnResize(ResizeCallback callback);
+
+Status HookWndProc(WndProcCallback callback, HWND window = nullptr);
+Status UnhookWndProc();
+void SetInputBlocked(bool blocked);
+bool IsInputBlocked();
 
 void** GetSwapChainVTable();
 void** GetDeviceVTable();
@@ -294,6 +386,26 @@ Status UnhookDevice(uint32_t index);
 Status UnhookContext(uint32_t index);
 Status UnhookCommandQueue(uint32_t index);
 
+void* GetOpenGLFunction(OpenGL::Function fn);
+void* GetVulkanFunction(Vulkan::Function fn);
+
+Status HookOpenGL(OpenGL::Function fn, void* detour, void** original);
+Status HookVulkan(Vulkan::Function fn, void* detour, void** original);
+
+Status UnhookOpenGL(OpenGL::Function fn);
+Status UnhookVulkan(Vulkan::Function fn);
+
+Status HookFunction(void* target, void* detour, void** original);
+Status HookExport(const char* moduleName, const char* exportName, void* detour, void** original);
+Status UnhookFunction(void* target);
+
+bool GetLastFrame(FrameContext* frame);
+HWND GetGameWindow();
+void* GetGameSwapChain();
+void* GetGameDevice();
+void* GetGameContext();
+void* GetGameCommandQueue();
+
 HWND GetWindow();
 void* GetSwapChain();
 void* GetDevice();
@@ -307,11 +419,73 @@ void* GetContextFromDevice(void* device);
 void* GetBackBuffer(void* swapChain, uint32_t index = 0);
 void* CreateRenderTargetView(void* device, void* backBuffer);
 void ReleaseRenderTargetView(void* rtv);
+void ReleaseObject(void* object);
 bool GetSwapChainSize(void* swapChain, uint32_t* width, uint32_t* height);
 HWND GetSwapChainWindow(void* swapChain);
 
 void* GetOriginalFunction(void** vtable, uint32_t index);
 
 const char* StatusToString(Status status);
+
+namespace Detail {
+    template <typename T>
+    struct Identity { using Type = T; };
+
+    template <typename Fn>
+    using EnableIfFunction = std::enable_if_t<std::is_pointer_v<Fn> && std::is_function_v<std::remove_pointer_t<Fn>>, int>;
+
+    template <typename Fn>
+    void* Erase(Fn fn) { return reinterpret_cast<void*>(fn); }
+}
+
+template <typename Fn, Detail::EnableIfFunction<Fn> = 0>
+Status HookSwapChain(uint32_t index, Fn detour, typename Detail::Identity<Fn>::Type* original) {
+    return HookSwapChain(index, Detail::Erase(detour), reinterpret_cast<void**>(original));
+}
+
+template <typename Fn, Detail::EnableIfFunction<Fn> = 0>
+Status HookDevice(uint32_t index, Fn detour, typename Detail::Identity<Fn>::Type* original) {
+    return HookDevice(index, Detail::Erase(detour), reinterpret_cast<void**>(original));
+}
+
+template <typename Fn, Detail::EnableIfFunction<Fn> = 0>
+Status HookContext(uint32_t index, Fn detour, typename Detail::Identity<Fn>::Type* original) {
+    return HookContext(index, Detail::Erase(detour), reinterpret_cast<void**>(original));
+}
+
+template <typename Fn, Detail::EnableIfFunction<Fn> = 0>
+Status HookCommandQueue(uint32_t index, Fn detour, typename Detail::Identity<Fn>::Type* original) {
+    return HookCommandQueue(index, Detail::Erase(detour), reinterpret_cast<void**>(original));
+}
+
+template <typename Fn, Detail::EnableIfFunction<Fn> = 0>
+Status HookOpenGL(OpenGL::Function fn, Fn detour, typename Detail::Identity<Fn>::Type* original) {
+    return HookOpenGL(fn, Detail::Erase(detour), reinterpret_cast<void**>(original));
+}
+
+template <typename Fn, Detail::EnableIfFunction<Fn> = 0>
+Status HookVulkan(Vulkan::Function fn, Fn detour, typename Detail::Identity<Fn>::Type* original) {
+    return HookVulkan(fn, Detail::Erase(detour), reinterpret_cast<void**>(original));
+}
+
+template <typename Fn, Detail::EnableIfFunction<Fn> = 0>
+Status HookFunction(Fn target, Fn detour, typename Detail::Identity<Fn>::Type* original) {
+    return HookFunction(Detail::Erase(target), Detail::Erase(detour), reinterpret_cast<void**>(original));
+}
+
+template <typename Fn, Detail::EnableIfFunction<Fn> = 0>
+Status HookFunction(void* target, Fn detour, typename Detail::Identity<Fn>::Type* original) {
+    return HookFunction(target, Detail::Erase(detour), reinterpret_cast<void**>(original));
+}
+
+template <typename Fn, Detail::EnableIfFunction<Fn> = 0>
+Status HookExport(const char* moduleName, const char* exportName, Fn detour, typename Detail::Identity<Fn>::Type* original) {
+    return HookExport(moduleName, exportName, Detail::Erase(detour), reinterpret_cast<void**>(original));
+}
+
+template <typename Fn, Detail::EnableIfFunction<Fn> = 0>
+Status UnhookFunction(Fn target) {
+    return UnhookFunction(Detail::Erase(target));
+}
 
 }
